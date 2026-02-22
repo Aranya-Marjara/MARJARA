@@ -1,6 +1,6 @@
-# MARJARA v2
+#  Model Architecture for Research in Joint Artificial Reasoning Algorithms (MARJARA)
 
-A transformer trained from scratch — production-ready LLM training stack with GQA, RoPE, MoE, KV cache, and distributed training.
+A(transformer) LLM training stack with GQA, RoPE, MoE, KV cache, and distributed training.
 
 ## Project Structure
 
