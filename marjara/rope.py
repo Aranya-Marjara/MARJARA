@@ -2,7 +2,7 @@
 Rotary Positional Embeddings (RoPE) with NTK and linear scaling.
 MARJARA v3 - rope.py
 
-Changes over DeepSeek v2:
+Changes over v2:
   - Cache rebuild doubles capacity each time (avoids rebuild on every new length)
   - NTK scaling applied to inv_freq (theta scaling), not to positional indices
   - Linear scaling applied to position indices (correct per Su et al.)
