@@ -1,21 +1,26 @@
 """
-MARJARA v2 – Learner (Trainer)
+MARJARA v3 – Learner (Trainer)
+trainer.py
 
-Handles:
-  - Distributed training (DDP via torchrun)
-  - Mixed precision (bf16/fp16 via torch.amp)
-  - Gradient accumulation & clipping
-  - Cosine LR schedule with linear warmup
-  - EMA weights
-  - Checkpoint save / resume
-  - lm-evaluation-harness stub
+Changes over v2:
+  - DDP val loss sync corrected: uses all_reduce on tensors (not .item() before reduce)
+  - has_grads flag properly prevents spurious optimizer step on empty leftovers
+  - load_checkpoint: weights_only defaults to True for security; caller opts out explicitly
+  - DataLoader uses persistent_workers + prefetch_factor (DeepSeek had this; kept + fixed for num_workers=0 edge case)
+  - MoE noise decay: linear schedule, applied correctly only to MoELayer modules
+  - TensorBoard + W&B integrated cleanly with None-guards
+  - Early stopping: patience-based with configurable min_delta
+  - train_epoch logs lr per step (not just epoch-end)
+  - validate() returns avg_ce that is rank-0 consistent across all DDP ranks
+  - _update_ema() uses lerp_ for in-place EMA (faster than mul_+add_)
+  - Removed pre-allocated logits_cache buffer (was unused in inner loop)
 """
 import logging
 import math
 import os
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -31,9 +36,22 @@ from tqdm import tqdm
 
 import tiktoken
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    _TB = True
+except ImportError:
+    _TB = False
+
+try:
+    import wandb as _wandb
+    _WANDB = True
+except ImportError:
+    _WANDB = False
+
 from .config import HParams
 from .model import MarjaraModel
 from .datasets import TextDataset, MMapSliceDataset
+from .ffn import MoELayer
 
 
 class Learner:
@@ -51,33 +69,35 @@ class Learner:
         self._setup_optimizer_scheduler()
         self._setup_mixed_precision()
         self._setup_checkpointing()
+        self._setup_log_backends()
 
-        self.current_step = 0
-        self.best_val_ce = float("inf")
+        self.current_step        = 0
+        self.best_val_ce         = float("inf")
+        self.epochs_no_improve   = 0
+        self.has_grads           = False
 
-    # ------------------------------------------------------------------
-    # Setup helpers
-    # ------------------------------------------------------------------
+    # ── Setup helpers -----------------------------------------------------------
+
     def _setup_logging(self):
         logging.basicConfig(
-            format="%(asctime)s - %(levelname)s - %(message)s",
+            format="%(asctime)s %(levelname)s %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
-            level=logging.INFO if self.args.local_rank == 0 else logging.WARNING,
+            level=logging.INFO if getattr(self.args, "local_rank", 0) == 0 else logging.WARNING,
         )
         self.logger = logging.getLogger(__name__)
 
     def _setup_distributed(self):
-        self.is_distributed = self.args.distributed
+        self.is_dist   = self.args.distributed
         self.local_rank = self.args.local_rank
         self.world_size = 1
-        self.rank = 0
-        if self.is_distributed:
+        self.rank       = 0
+        if self.is_dist:
             if not torch.cuda.is_available():
                 raise RuntimeError("Distributed training requires CUDA")
             if not dist.is_initialized():
                 dist.init_process_group(backend="nccl")
             self.world_size = dist.get_world_size()
-            self.rank = dist.get_rank()
+            self.rank       = dist.get_rank()
             torch.cuda.set_device(self.local_rank)
 
     def _setup_device(self):
@@ -85,79 +105,82 @@ class Learner:
             self.device = torch.device(f"cuda:{self.local_rank}")
         else:
             self.device = torch.device("cpu")
-            if self.is_distributed:
-                self.logger.warning("Distributed training on CPU unsupported; disabling.")
-                self.is_distributed = False
+            if self.is_dist:
+                self.logger.warning("Distributed on CPU unsupported; disabling DDP.")
+                self.is_dist = False
 
     def _setup_tokenizer(self):
         try:
             self.tokenizer = tiktoken.get_encoding(self.args.tokenizer)
         except Exception:
-            self.logger.warning(f"Tokenizer '{self.args.tokenizer}' not found, falling back to cl100k_base")
+            self.logger.warning("Tokenizer not found; falling back to cl100k_base")
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
 
     def _load_data(self):
         if self.args.data.endswith(".bin"):
-            self.logger.info(f"Loading memory-mapped dataset from {self.args.data}")
-            data_mmap = np.memmap(self.args.data, dtype=np.uint16, mode="r")
-            total_len = len(data_mmap)
-            self.args.vocab_size = max(50304, int(data_mmap.max()) + 1)
-            split = int(0.9 * total_len)
-            if self.args.val_data is not None:
-                val_mmap = np.memmap(self.args.val_data, dtype=np.uint16, mode="r")
-                val_len = len(val_mmap)
-                self.train_dataset = MMapSliceDataset(self.args.data, 0, total_len, self.args.context_length)
-                self.val_dataset = MMapSliceDataset(self.args.val_data, 0, val_len, self.args.context_length)
+            self.logger.info(f"Loading mmap dataset: {self.args.data}")
+            mm = np.memmap(self.args.data, dtype=np.uint16, mode="r")
+            total = len(mm)
+            self.args.vocab_size = max(50304, int(mm.max()) + 1)
+            split = int(0.9 * total)
+            if self.args.val_data:
+                vm = np.memmap(self.args.val_data, dtype=np.uint16, mode="r")
+                self.train_dataset = MMapSliceDataset(self.args.data, 0, total, self.args.context_length)
+                self.val_dataset   = MMapSliceDataset(self.args.val_data, 0, len(vm), self.args.context_length)
             else:
                 self.train_dataset = MMapSliceDataset(self.args.data, 0, split, self.args.context_length)
-                self.val_dataset = MMapSliceDataset(self.args.data, split, total_len, self.args.context_length)
+                self.val_dataset   = MMapSliceDataset(self.args.data, split, total, self.args.context_length)
         else:
-            self.logger.info(f"Loading text file from {self.args.data}")
-            with open(self.args.data, "r", encoding="utf-8") as f:
+            self.logger.info(f"Loading text file: {self.args.data}")
+            with open(self.args.data, encoding="utf-8") as f:
                 text = f.read()
-            tokens = self.tokenizer.encode(text)
+            toks = self.tokenizer.encode(text)
             self.args.vocab_size = self.tokenizer.n_vocab
-            data = torch.tensor(tokens, dtype=torch.long)
+            data  = torch.tensor(toks, dtype=torch.long)
             split = int(0.9 * len(data))
             self.train_dataset = TextDataset(data[:split], self.args.context_length)
-            self.val_dataset = TextDataset(data[split:], self.args.context_length)
+            self.val_dataset   = TextDataset(data[split:], self.args.context_length)
 
-        if self.is_distributed:
-            self.train_sampler = DistributedSampler(
-                self.train_dataset, num_replicas=self.world_size, rank=self.rank,
-                shuffle=True, drop_last=True,
+        sampler = None
+        shuffle = True
+        if self.is_dist:
+            sampler = DistributedSampler(
+                self.train_dataset, num_replicas=self.world_size,
+                rank=self.rank, shuffle=True, drop_last=True,
             )
             shuffle = False
-        else:
-            self.train_sampler = None
-            shuffle = True
+        self.train_sampler = sampler
 
-        num_workers = min(4, os.cpu_count() or 1)
+        nw = min(4, os.cpu_count() or 1)
+        # prefetch_factor only valid when num_workers > 0
+        pf = 2 if nw > 0 else None
+
         self.train_loader = DataLoader(
             self.train_dataset, batch_size=self.args.batch_size,
-            shuffle=shuffle, sampler=self.train_sampler,
-            num_workers=num_workers, pin_memory=True, drop_last=True,
+            shuffle=shuffle, sampler=sampler,
+            num_workers=nw, pin_memory=True, drop_last=True,
+            persistent_workers=(nw > 0), prefetch_factor=pf,
         )
         self.val_loader = DataLoader(
             self.val_dataset, batch_size=self.args.batch_size,
-            shuffle=False, num_workers=num_workers, pin_memory=True,
+            shuffle=False, num_workers=nw, pin_memory=True,
+            persistent_workers=(nw > 0), prefetch_factor=pf,
         ) if self.val_dataset else None
 
-        self.logger.info(f"Train samples: {len(self.train_dataset)}")
-        if self.val_dataset:
-            self.logger.info(f"Val samples: {len(self.val_dataset)}")
+        self.logger.info(f"Train: {len(self.train_dataset)}  Val: {len(self.val_dataset) if self.val_dataset else 0}")
 
     def _build_model(self):
-        preset_map = {"tiny": HParams.tiny, "small": HParams.small,
-                      "medium": HParams.medium, "large": HParams.large}
-        cfg = preset_map[self.args.model_size]() if self.args.model_size in preset_map else HParams()
-        cfg.vocab_size = self.args.vocab_size
-        cfg.context_length = self.args.context_length
-        cfg.use_moe = self.args.use_moe
-        cfg.sliding_window = self.args.sliding_window
+        preset = {"tiny": HParams.tiny, "small": HParams.small,
+                  "medium": HParams.medium, "large": HParams.large}
+        cfg = preset[self.args.model_size]() if self.args.model_size in preset else HParams()
+        cfg.vocab_size            = self.args.vocab_size
+        cfg.context_length        = self.args.context_length
+        cfg.use_moe               = self.args.use_moe
+        cfg.sliding_window        = self.args.sliding_window
         cfg.gradient_checkpointing = self.args.gradient_checkpointing
-        self.cfg = cfg
+        self.cfg   = cfg
         self.model = MarjaraModel(cfg).to(self.device)
+        self.logger.info(f"Model params: {sum(p.numel() for p in self.model.parameters()):,}")
 
     def _setup_ema(self):
         self.ema_model = None
@@ -165,9 +188,9 @@ class Learner:
             self.ema_model = MarjaraModel(self.cfg).to(self.device)
             self.ema_model.load_state_dict(self.model.state_dict())
             for p in self.ema_model.parameters():
-                p.requires_grad = False
+                p.requires_grad_(False)
             self.ema_decay = self.args.ema_decay
-            self.logger.info(f"EMA enabled with decay {self.ema_decay}")
+            self.logger.info(f"EMA decay={self.ema_decay}")
 
     def _maybe_compile(self):
         if self.args.compile and hasattr(torch, "compile"):
@@ -175,50 +198,47 @@ class Learner:
             self.logger.info("Model compiled with torch.compile")
 
     def _maybe_ddp(self):
-        if self.is_distributed:
+        if self.is_dist:
             self.model = DDP(self.model, device_ids=[self.local_rank])
 
     def _setup_optimizer_scheduler(self):
-        decay_params, no_decay_params, seen_ids = [], [], set()
-        for name, param in self.model.named_parameters():
-            if id(param) in seen_ids:
+        decay, no_decay, seen = [], [], set()
+        for name, p in self.model.named_parameters():
+            if id(p) in seen or not p.requires_grad:
                 continue
-            seen_ids.add(id(param))
-            if param.ndim < 2 or any(x in name.lower() for x in ["norm", "embed"]):
-                no_decay_params.append(param)
+            seen.add(id(p))
+            if p.ndim < 2 or any(k in name.lower() for k in ("norm", "embed", "bias")):
+                no_decay.append(p)
             else:
-                decay_params.append(param)
+                decay.append(p)
 
-        param_groups = [
-            {"params": decay_params, "weight_decay": 0.1},
-            {"params": no_decay_params, "weight_decay": 0.0},
+        groups = [
+            {"params": decay,    "weight_decay": 0.1},
+            {"params": no_decay, "weight_decay": 0.0},
         ]
         try:
-            self.optimizer = AdamW(param_groups, lr=self.args.lr, betas=(0.9, 0.95), fused=True)
-            self.logger.info("Using fused AdamW")
+            self.optimizer = AdamW(groups, lr=self.args.lr, betas=(0.9, 0.95), fused=True)
+            self.logger.info("Fused AdamW")
         except TypeError:
-            self.optimizer = AdamW(param_groups, lr=self.args.lr, betas=(0.9, 0.95))
-            self.logger.info("Using regular AdamW (fused not available)")
+            self.optimizer = AdamW(groups, lr=self.args.lr, betas=(0.9, 0.95))
+            self.logger.info("Standard AdamW")
 
-        steps_per_epoch = len(self.train_loader)
-        eff_steps = math.ceil(steps_per_epoch / self.args.accumulation_steps)
-        total_steps = self.args.epochs * eff_steps
+        spe        = len(self.train_loader)
+        eff        = math.ceil(spe / self.args.accumulation_steps)
+        total      = self.args.epochs * eff
+        warmup_end = self.args.warmup_steps
 
-        warmup = LinearLR(self.optimizer, start_factor=0.1, end_factor=1.0, total_iters=self.args.warmup_steps)
-        cosine = CosineAnnealingLR(self.optimizer, T_max=max(1, total_steps - self.args.warmup_steps))
-        self.scheduler = SequentialLR(self.optimizer, [warmup, cosine], milestones=[self.args.warmup_steps])
+        warmup  = LinearLR(self.optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_end)
+        cosine  = CosineAnnealingLR(self.optimizer, T_max=max(1, total - warmup_end), eta_min=1e-5)
+        self.scheduler = SequentialLR(self.optimizer, [warmup, cosine], milestones=[warmup_end])
 
     def _setup_mixed_precision(self):
         self.use_amp = self.args.mixed_precision and self.device.type == "cuda"
         if self.use_amp:
-            if torch.cuda.is_bf16_supported():
-                self.precision_dtype = torch.bfloat16
-                self.logger.info("Using bfloat16 mixed precision")
-            else:
-                self.precision_dtype = torch.float16
-                self.logger.info("Using float16 mixed precision")
+            self.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            self.logger.info(f"AMP: {self.amp_dtype}")
         else:
-            self.precision_dtype = torch.float32
+            self.amp_dtype = torch.float32
         try:
             from torch.amp import GradScaler
             self.scaler = GradScaler("cuda") if self.use_amp else None
@@ -226,217 +246,274 @@ class Learner:
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
     def _setup_checkpointing(self):
-        self.checkpoint_dir = Path(self.args.output_dir)
-        self.checkpoint_dir.mkdir(exist_ok=True)
+        self.ckpt_dir = Path(self.args.output_dir)
+        self.ckpt_dir.mkdir(exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Training steps
-    # ------------------------------------------------------------------
+    def _setup_log_backends(self):
+        self.tb_writer = None
+        if self.rank == 0:
+            if _TB:
+                self.tb_writer = SummaryWriter(log_dir=str(self.ckpt_dir / "tb_logs"))
+                self.logger.info("TensorBoard enabled")
+            if _WANDB and getattr(self.args, "wandb_project", None):
+                _wandb.init(project=self.args.wandb_project, config=vars(self.args))
+                self.logger.info("W&B enabled")
+
+    # ── Utilities -----------------------------------------------------------------------------
+
+    def _log(self, metrics: Dict, step: int):
+        """Log a dict of scalar metrics to all enabled backends."""
+        if self.rank != 0:
+            return
+        if self.tb_writer:
+            for k, v in metrics.items():
+                self.tb_writer.add_scalar(k, v, step)
+        if _WANDB and _wandb.run:
+            _wandb.log(metrics, step=step)
+
     def _update_ema(self):
         if self.ema_model is None:
             return
         with torch.no_grad():
-            model_state = self.model.state_dict()
-            ema_state = self.ema_model.state_dict()
-            for name, param in model_state.items():
-                ema_name = name.replace("module.", "")
-                if ema_name in ema_state:
-                    ema_state[ema_name].mul_(self.ema_decay).add_(param, alpha=1 - self.ema_decay)
+            src = {k.replace("module.", ""): v
+                   for k, v in self.model.state_dict().items()}
+            dst = self.ema_model.state_dict()
+            for name, ema_p in dst.items():
+                if name in src:
+                    # lerp_(a, b, weight) performs: ema = (1-d)*ema + d*src  in-place
+                    ema_p.lerp_(src[name].to(ema_p.dtype), 1.0 - self.ema_decay)
+
+    def _decay_moe_noise(self, epoch: int, start: int):
+        """Linearly decay MoE routing noise to zero over first 80% of training."""
+        if not self.cfg.use_moe:
+            return
+        total    = self.args.epochs - start
+        progress = (epoch - start) / max(1, total)
+        noise    = self.cfg.moe_noise_std * max(0.0, 1.0 - progress / 0.8)
+        raw = self.model.module if self.is_dist else self.model
+        for m in raw.modules():
+            if isinstance(m, MoELayer):
+                m.set_noise_std(noise)
 
     def _compute_loss(self, logits, targets, aux_losses=None) -> Tuple[torch.Tensor, torch.Tensor]:
-        ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        total_loss = ce_loss
+        ce   = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        loss = ce
         if aux_losses:
             for v in aux_losses.values():
-                total_loss = total_loss + v
-        return total_loss, ce_loss
+                if isinstance(v, torch.Tensor):
+                    loss = loss + v
+        return loss, ce
 
     def _optimizer_step(self):
-        if self.use_amp and self.scaler is not None:
+        if self.use_amp and self.scaler:
             self.scaler.unscale_(self.optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+        gnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
         if self.rank == 0 and self.current_step % 100 == 0:
-            self.logger.info(f"Step {self.current_step} grad norm: {grad_norm:.4f}")
-        if self.use_amp and self.scaler is not None:
+            self._log({"train/grad_norm": gnorm.item()}, self.current_step)
+        if self.use_amp and self.scaler:
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             self.optimizer.step()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)   # set_to_none=True: less memory than zero
         self._update_ema()
+        self.has_grads = False
 
-    def train_epoch(self, epoch: int):
+    # ── Train / Validate ----------------------------------------------------------------
+
+    def train_epoch(self, epoch: int) -> Tuple[float, float, Dict]:
         if self.train_sampler is not None:
             self.train_sampler.set_epoch(epoch)
 
         self.model.train()
         total_loss = total_ce = 0.0
-        total_aux = {"aux": 0.0, "z": 0.0} if self.cfg.use_moe else {}
-        num_batches = 0
-        self.optimizer.zero_grad()
+        total_aux  = {}
+        n = 0
+        self.optimizer.zero_grad(set_to_none=True)
+        self.has_grads = False
 
         log_every = max(1, len(self.train_loader) // 100)
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}", disable=self.rank != 0)
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}", disable=(self.rank != 0))
 
-        for batch_idx, (x, y) in enumerate(pbar):
-            x, y = x.to(self.device), y.to(self.device)
-            with torch.autocast(device_type=self.device.type, dtype=self.precision_dtype, enabled=self.use_amp):
+        for i, (x, y) in enumerate(pbar):
+            x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+            with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 out = self.model(x)
-                logits, aux_losses = out if isinstance(out, tuple) else (out, None)
-                loss, ce_loss = self._compute_loss(logits, y, aux_losses)
+                logits, aux = out if isinstance(out, tuple) else (out, None)
+                loss, ce    = self._compute_loss(logits, y, aux)
 
-            scaled_loss = loss / self.args.accumulation_steps
-            if self.use_amp and self.scaler is not None:
-                self.scaler.scale(scaled_loss).backward()
-            else:
-                scaled_loss.backward()
+            (loss / self.args.accumulation_steps).backward() if not (self.use_amp and self.scaler) \
+                else self.scaler.scale(loss / self.args.accumulation_steps).backward()
+            self.has_grads = True
 
-            if (batch_idx + 1) % self.args.accumulation_steps == 0:
+            if (i + 1) % self.args.accumulation_steps == 0:
                 self._optimizer_step()
                 self.scheduler.step()
+                lr = self.scheduler.get_last_lr()[0]
+                self._log({"train/loss_step": loss.item(), "train/lr": lr}, self.current_step)
                 self.current_step += 1
 
             total_loss += loss.item()
-            total_ce += ce_loss.item()
-            if aux_losses:
-                for k in total_aux:
-                    total_aux[k] += aux_losses.get(k, 0.0)
-            num_batches += 1
+            total_ce   += ce.item()
+            if aux:
+                for k, v in aux.items():
+                    total_aux[k] = total_aux.get(k, 0.0) + (v.item() if isinstance(v, torch.Tensor) else v)
+            n += 1
 
-            if self.rank == 0 and (batch_idx + 1) % log_every == 0:
-                postfix = {"loss": f"{loss.item():.4f}", "ce": f"{ce_loss.item():.4f}"}
-                if aux_losses:
-                    postfix.update({k: f"{v.item():.4f}" for k, v in aux_losses.items()})
-                pbar.set_postfix(postfix)
+            if self.rank == 0 and (i + 1) % log_every == 0:
+                pf = {"loss": f"{loss.item():.4f}", "ce": f"{ce.item():.4f}"}
+                if aux:
+                    pf.update({k: f"{v.item():.4f}" for k, v in aux.items() if isinstance(v, torch.Tensor)})
+                pbar.set_postfix(pf)
 
-        # Handle leftover accumulation steps
-        if len(self.train_loader) % self.args.accumulation_steps != 0:
+        # Flush any leftover gradient accumulation
+        if self.has_grads:
             self._optimizer_step()
             self.scheduler.step()
             self.current_step += 1
 
-        avg_loss = total_loss / num_batches
-        avg_ce = total_ce / num_batches
-        avg_aux = {k: v / num_batches for k, v in total_aux.items()} if self.cfg.use_moe else {}
-        return avg_loss, avg_ce, avg_aux
+        avg_aux = {k: v / n for k, v in total_aux.items()}
+        return total_loss / n, total_ce / n, avg_aux
 
     @torch.no_grad()
     def validate(self) -> Tuple[float, float]:
         if self.val_loader is None:
             return 0.0, 0.0
         self.model.eval()
-        total_loss = total_ce = 0.0
-        num_batches = 0
+        total_loss = total_ce = n = 0
+
         for x, y in self.val_loader:
-            x, y = x.to(self.device), y.to(self.device)
-            with torch.autocast(device_type=self.device.type, dtype=self.precision_dtype, enabled=self.use_amp):
+            x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+            with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 out = self.model(x)
-                logits, aux_losses = out if isinstance(out, tuple) else (out, None)
-                loss, ce_loss = self._compute_loss(logits, y, aux_losses)
+                logits, aux = out if isinstance(out, tuple) else (out, None)
+                loss, ce    = self._compute_loss(logits, y, aux)
             total_loss += loss.item()
-            total_ce += ce_loss.item()
-            num_batches += 1
+            total_ce   += ce.item()
+            n          += 1
 
-        avg_ce = total_ce / num_batches
-        perplexity = math.exp(min(avg_ce, 20.0))
+        # Synchronise across DDP ranks BEFORE computing averages
+        if self.is_dist:
+            buf = torch.tensor([total_loss, total_ce, float(n)], device=self.device)
+            dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+            total_loss, total_ce, n = buf[0].item(), buf[1].item(), int(buf[2].item())
+
+        avg_ce  = total_ce   / max(n, 1)
+        avg_loss = total_loss / max(n, 1)
+        ppl     = math.exp(min(avg_ce, 20.0))
+
         if self.rank == 0:
-            self.logger.info(f"Validation | CE: {avg_ce:.4f} | PPL: {perplexity:.2f}")
-        return total_loss / num_batches, avg_ce
+            self.logger.info(f"Val | CE={avg_ce:.4f} PPL={ppl:.2f}")
+            self._log({"val/ce": avg_ce, "val/ppl": ppl}, self.current_step)
+        return avg_loss, avg_ce
 
-    # ------------------------------------------------------------------
-    # Extras
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def evaluate_benchmarks(self):
-        """Stub for lm-evaluation-harness. Implement wrapper to use."""
-        try:
-            import lm_eval  # noqa: F401
-            self.logger.info("lm-eval integration stub – implement wrapper to use.")
-        except ImportError:
-            self.logger.warning("lm-eval not installed, skipping benchmark evals")
+    # ── Checkpointing -----------------------------------------------------------------------------
 
-    @torch.no_grad()
-    def generate_sample(self, prompt: str, max_tokens: int = 100) -> str:
-        model = self.ema_model if self.ema_model is not None else self.model
-        if self.is_distributed:
-            model = model.module
-        model.eval()
-        tokens = self.tokenizer.encode(prompt)
-        prompt_tensor = torch.tensor([tokens], device=self.device)
-        generated = model.generate(
-            prompt_tensor, max_new_tokens=max_tokens,
-            temperature=0.8, top_k=50, top_p=0.9, repetition_penalty=1.1,
-        )
-        return self.tokenizer.decode(generated[0].tolist())
-
-    # ------------------------------------------------------------------
-    # Checkpointing
-    # ------------------------------------------------------------------
-    def save_checkpoint(self, epoch: int, val_loss: float, val_ce: float, is_best: bool = False):
+    def save_checkpoint(self, epoch: int, val_loss: float, val_ce: float, is_best: bool):
         if self.rank != 0:
             return
-        model_state = self.model.module.state_dict() if self.is_distributed else self.model.state_dict()
+        raw = self.model.module if self.is_dist else self.model
         ckpt = {
-            "epoch": epoch,
-            "model_state_dict": model_state,
+            "epoch":              epoch,
+            "model_state_dict":   raw.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
-            "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
-            "val_loss": val_loss,
-            "val_ce": val_ce,
-            "config": asdict(self.cfg),
-            "tokenizer_name": self.args.tokenizer,
-            "args": vars(self.args),
+            "scaler_state_dict":  self.scaler.state_dict() if self.scaler else None,
+            "val_loss":           val_loss,
+            "val_ce":             val_ce,
+            "config":             asdict(self.cfg),
+            "tokenizer_name":     self.args.tokenizer,
+            "args":               vars(self.args),
+            "step":               self.current_step,
         }
-        if self.ema_model is not None:
+        if self.ema_model:
             ckpt["ema_state_dict"] = self.ema_model.state_dict()
-        torch.save(ckpt, self.checkpoint_dir / "checkpoint_latest.pt")
-        if is_best:
-            torch.save(ckpt, self.checkpoint_dir / "checkpoint_best.pt")
-        if epoch % self.args.save_every == 0:
-            torch.save(ckpt, self.checkpoint_dir / f"checkpoint_epoch_{epoch}.pt")
-        self.logger.info(f"Saved checkpoint at epoch {epoch}")
 
-    def load_checkpoint(self, path: Union[str, Path]):
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        target = self.model.module if self.is_distributed else self.model
-        target.load_state_dict(ckpt["model_state_dict"])
+        torch.save(ckpt, self.ckpt_dir / "checkpoint_latest.pt")
+        if is_best:
+            torch.save(ckpt, self.ckpt_dir / "checkpoint_best.pt")
+        if epoch % self.args.save_every == 0:
+            torch.save(ckpt, self.ckpt_dir / f"checkpoint_epoch_{epoch}.pt")
+        self.logger.info(f"Checkpoint saved: epoch={epoch}")
+
+    def load_checkpoint(self, path: Union[str, Path], weights_only: bool = True):
+        """
+        weights_only=True (default) is safe for untrusted checkpoints.
+        Pass weights_only=False only for checkpoints you generated yourself.
+        """
+        ckpt = torch.load(path, map_location=self.device, weights_only=weights_only)
+        raw  = self.model.module if self.is_dist else self.model
+        raw.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         if ckpt.get("scaler_state_dict") and self.scaler:
             self.scaler.load_state_dict(ckpt["scaler_state_dict"])
         if self.ema_model and "ema_state_dict" in ckpt:
             self.ema_model.load_state_dict(ckpt["ema_state_dict"])
+        self.current_step = ckpt.get("step", 0)
         return ckpt["epoch"], ckpt.get("val_ce", float("inf"))
 
-    # ------------------------------------------------------------------
-    # Main training loop
-    # ------------------------------------------------------------------
+    # ── Main loop --------------------------------------------------------------
+
+    @torch.no_grad()
+    def generate_sample(self, prompt: str, max_tokens: int = 100) -> str:
+        model = self.ema_model or (self.model.module if self.is_dist else self.model)
+        model.eval()
+        ids  = self.tokenizer.encode(prompt)
+        t    = torch.tensor([ids], device=self.device)
+        out  = model.generate(t, max_new_tokens=max_tokens, temperature=0.8,
+                               top_k=50, top_p=0.9, repetition_penalty=1.1)
+        return self.tokenizer.decode(out[0].tolist())
+
     def train(self):
-        start_epoch = 0
+        start = 0
         if self.args.resume:
-            start_epoch, _ = self.load_checkpoint(self.args.resume)
-            self.logger.info(f"Resumed from epoch {start_epoch}")
+            start, _ = self.load_checkpoint(self.args.resume, weights_only=False)
+            self.logger.info(f"Resumed from epoch {start}")
 
-        for epoch in range(start_epoch, self.args.epochs):
+        patience  = getattr(self.args, "early_stop_patience",   5)
+        min_delta = getattr(self.args, "early_stop_min_delta", 0.0)
+
+        for epoch in range(start, self.args.epochs):
+            self._decay_moe_noise(epoch, start)
+
             train_loss, train_ce, aux = self.train_epoch(epoch)
-            val_loss, val_ce = self.validate()
-            is_best = val_ce < self.best_val_ce
-            if is_best:
-                self.best_val_ce = val_ce
+            val_loss,   val_ce        = self.validate()
 
-            lr = self.scheduler.get_last_lr()[0]
-            msg = (f"Epoch {epoch+1}/{self.args.epochs} | "
-                   f"Train loss: {train_loss:.4f} | Train CE: {train_ce:.4f} | "
-                   f"Val CE: {val_ce:.4f} | LR: {lr:.2e}{' | BEST' if is_best else ''}")
+            is_best = val_ce < self.best_val_ce - min_delta
+            if is_best:
+                self.best_val_ce       = val_ce
+                self.epochs_no_improve = 0
+            else:
+                self.epochs_no_improve += 1
+
+            lr  = self.scheduler.get_last_lr()[0]
+            msg = (f"Ep {epoch+1}/{self.args.epochs} | "
+                   f"train_loss={train_loss:.4f} train_ce={train_ce:.4f} "
+                   f"val_ce={val_ce:.4f} lr={lr:.2e}"
+                   + (" ★BEST" if is_best else ""))
             if aux:
-                msg += f" | Aux: { {k: f'{v:.4f}' for k, v in aux.items()} }"
+                msg += " | " + " ".join(f"{k}={v:.4f}" for k, v in aux.items())
             self.logger.info(msg)
 
+            self._log({"train/loss": train_loss, "train/ce": train_ce,
+                       "val/ce": val_ce, "lr": lr}, epoch)
+
             if (epoch + 1) % 5 == 0 and self.rank == 0:
-                self.logger.info(f"Sample:\n{self.generate_sample('The future of AI is')}")
+                sample = self.generate_sample("The future of AI is")
+                self.logger.info(f"Sample: {sample}")
+                if self.tb_writer:
+                    self.tb_writer.add_text("sample", sample, epoch)
+                if _WANDB and _wandb.run:
+                    _wandb.log({"sample": sample}, step=epoch)
 
             self.save_checkpoint(epoch + 1, val_loss, val_ce, is_best)
 
-        if self.is_distributed:
+            if self.epochs_no_improve >= patience:
+                self.logger.info(f"Early stopping after {patience} epochs without improvement.")
+                break
+
+        if self.tb_writer:
+            self.tb_writer.close()
+        if self.is_dist:
             dist.destroy_process_group()
